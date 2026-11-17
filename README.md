@@ -1,4 +1,4 @@
-# Mavis
+# RDCRAMAN
 ## RDC and RemoteApp Manager
 
 [Download the latest Windows x64 build](build/DesktopAndRemoteApp.exe).
