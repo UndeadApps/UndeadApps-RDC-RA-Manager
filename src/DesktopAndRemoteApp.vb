@@ -313,6 +313,44 @@ End Class
 Friend NotInheritable Class DesktopView
     Inherits AxHost
 
+    Private Shared ReadOnly RdpEvents As New Guid("336d5562-efa8-482e-8cb3-c5c0fc7a7db6")
+    Private Const RemoteDesktopSizeChange As Integer = 12
+    Private ReadOnly sizeChangedHandler As Action(Of Integer, Integer) = AddressOf RecordRemoteSize
+    Private eventSource As Object
+    Private lastRemoteSize As Size
+    Public ReadOnly Property RemoteSize As Size
+        Get
+            Return lastRemoteSize
+        End Get
+    End Property
+
+    Protected Overrides Sub CreateSink()
+        MyBase.CreateSink()
+        Dim client = GetOcx()
+        ComEventsHelper.Combine(client, RdpEvents, RemoteDesktopSizeChange, sizeChangedHandler)
+        eventSource = client
+    End Sub
+
+    Protected Overrides Sub DetachSink()
+        Try
+            If eventSource IsNot Nothing Then
+                ComEventsHelper.Remove(eventSource, RdpEvents, RemoteDesktopSizeChange, sizeChangedHandler)
+                eventSource = Nothing
+            End If
+        Finally
+            MyBase.DetachSink()
+        End Try
+    End Sub
+
+    Private Sub RecordRemoteSize(width As Integer, height As Integer)
+        lastRemoteSize = New Size(width, height)
+    End Sub
+
+    Public Shared Function ProtocolSize(size As Size) As Size
+        Dim width = Math.Min(8192, Math.Max(200, size.Width))
+        Return New Size(width - width Mod 2, Math.Min(8192, Math.Max(200, size.Height)))
+    End Function
+
     Public Sub New()
         MyBase.New("A0C63C30-F08D-4AB4-907C-34905D770C7D")
     End Sub
@@ -377,6 +415,8 @@ Friend NotInheritable Class Session
     Public SeenConnection As Boolean
     Public AppliedSize As Size
     Public AppliedDpi As Integer
+    Public RequestedSize As Size
+    Public ResolutionDeadline As DateTime
 End Class
 
 Friend NotInheritable Class ManagerTheme
@@ -485,6 +525,15 @@ Friend NotInheritable Class ManagerWindow
     Private palette As ManagerTheme
     Private ReadOnly tree As New TreeView()
     Private ReadOnly stage As New Panel()
+    Private Shared ReadOnly zombieBackground As New Lazy(Of Image)(
+        Function()
+            Using stream = GetType(ManagerWindow).Assembly.GetManifestResourceStream("ZombieGreen.png")
+                If stream Is Nothing Then Return Nothing
+                Using artwork = Image.FromStream(stream)
+                    Return New Bitmap(artwork)
+                End Using
+            End Using
+        End Function)
     Private ReadOnly rootLayout As New TableLayoutPanel()
     Private ReadOnly split As New SplitContainer()
     Private ReadOnly sidebar As New TableLayoutPanel()
@@ -520,6 +569,7 @@ Friend NotInheritable Class ManagerWindow
     Private ReadOnly sessions As New Dictionary(Of String, Session)(StringComparer.OrdinalIgnoreCase)
     Private ReadOnly stateTimer As New Timer With {.Interval = 800}
     Private ReadOnly statusText As New Label()
+    Private Const StatusBarHeight As Integer = 21
 
     Public Sub New()
         Text = "Desktop and RemoteApp"
@@ -537,7 +587,7 @@ Friend NotInheritable Class ManagerWindow
         rootLayout.ColumnCount = 1
         rootLayout.Padding = New Padding(12)
         rootLayout.RowStyles.Add(New RowStyle(SizeType.Percent, 100))
-        rootLayout.RowStyles.Add(New RowStyle(SizeType.Absolute, 33))
+        rootLayout.RowStyles.Add(New RowStyle(SizeType.Absolute, StatusBarHeight))
         Me.Controls.Add(rootLayout)
         split.Dock = DockStyle.Fill
         split.SplitterWidth = 7
@@ -590,6 +640,7 @@ Friend NotInheritable Class ManagerWindow
         StyleButton(fullScreenButton, "Full screen", AddressOf ToggleSessionFullScreen)
         controls.Controls.Add(fullScreenButton)
         stage.Dock = DockStyle.Fill
+        stage.BackgroundImageLayout = ImageLayout.Zoom
         stage.BackColor = palette.Workspace
         sessionLayout.Controls.Add(stage, 0, 2)
         hint.Dock = DockStyle.Fill
@@ -599,6 +650,8 @@ Friend NotInheritable Class ManagerWindow
         ConfigureFullScreenBar()
         statusText.TextAlign = ContentAlignment.MiddleLeft
         statusText.Dock = DockStyle.Fill
+        statusText.Margin = New Padding(3, 0, 3, 0)
+        statusText.AutoEllipsis = True
         statusText.ForeColor = palette.Muted
         rootLayout.Controls.Add(statusText, 0, 1)
 
@@ -672,6 +725,14 @@ Friend NotInheritable Class ManagerWindow
         Render()
     End Sub
 
+    Protected Overrides Sub OnFormClosing(args As FormClosingEventArgs)
+        MyBase.OnFormClosing(args)
+        If args.Cancel OrElse args.CloseReason <> CloseReason.UserClosing OrElse sessions.Count = 0 Then Return
+        Dim prompt = "Exiting will disconnect " & If(sessions.Count = 1, "the open RDP connection.", sessions.Count & " open RDP connections.")
+        args.Cancel = MessageBox.Show(Me, prompt & Environment.NewLine & "Exit the manager?", "Confirm exit",
+            MessageBoxButtons.YesNo, MessageBoxIcon.Warning, MessageBoxDefaultButton.Button2) <> DialogResult.Yes
+    End Sub
+
     Private Sub BuildSidebar()
         sidebar.Dock = DockStyle.Fill
         sidebar.ColumnCount = 2
@@ -732,6 +793,8 @@ Friend NotInheritable Class ManagerWindow
 
     Private Sub ApplyTheme()
         ColorControls(Me)
+        stage.BackgroundImage = If(palette.Name = "Zombie Green", zombieBackground.Value, Nothing)
+        If stage.BackgroundImage IsNot Nothing Then hint.BackColor = Color.Transparent
         tree.LineColor = palette.Muted
         heading.ForeColor = palette.Accent
         hint.ForeColor = palette.Muted
@@ -948,7 +1011,7 @@ Friend NotInheritable Class ManagerWindow
             heading.Visible = Not enabled
             sessionLayout.GetControlFromPosition(0, 1).Visible = Not enabled
             rootLayout.Padding = If(enabled, New Padding(0), New Padding(12))
-            rootLayout.RowStyles(1).Height = If(enabled, 0, 33)
+            rootLayout.RowStyles(1).Height = If(enabled, 0, StatusBarHeight)
             sessionLayout.RowStyles(0).Height = If(enabled, 0, 43)
             sessionLayout.RowStyles(1).Height = If(enabled, 0, 38)
             If Not enabled Then
@@ -1003,6 +1066,12 @@ Friend NotInheritable Class ManagerWindow
             File.WriteAllText(preference, themeName)
             palette = ManagerTheme.Load(preference)
             ApplyTheme()
+            If (stage.BackgroundImage IsNot Nothing) <> (themeName = "Zombie Green") Then
+                Throw New InvalidOperationException("The background must appear only in Zombie Green.")
+            End If
+            If stage.BackgroundImage IsNot Nothing AndAlso hint.BackColor <> Color.Transparent Then
+                Throw New InvalidOperationException("The idle text hides the theme background.")
+            End If
             If palette.Name <> themeName OrElse BackColor <> palette.Background OrElse tree.BackColor <> palette.Surface OrElse
                 stage.BackColor <> palette.Workspace OrElse heading.ForeColor <> palette.Accent OrElse
                 Not DirectCast(themeMenu.Items(Array.IndexOf(ManagerTheme.Names, themeName)), ToolStripMenuItem).Checked Then
@@ -1056,6 +1125,15 @@ Friend NotInheritable Class ManagerWindow
             FormBorderStyle <> normalBorder OrElse view.IsDisposed OrElse view.Handle <> originalHandle Then
             Throw New InvalidOperationException("Exiting full screen did not restore the manager and its RDP view.")
         End If
+        Dim active = sessions(item.FilePath)
+        active.RequestedSize = New Size(1280, 720)
+        active.ResolutionDeadline = DateTime.UtcNow.AddSeconds(-1)
+        CheckRequestedDisplay(active)
+        If Not active.RequestedSize.IsEmpty OrElse active.ResolutionText <> "Auto fit" OrElse
+            view.Dock <> DockStyle.Fill OrElse Not statusText.Text.Contains("did not confirm") Then
+            Throw New InvalidOperationException("An unconfirmed resize changed the active display.")
+        End If
+        If rootLayout.RowStyles(1).Height <> StatusBarHeight Then Throw New InvalidOperationException("The status bar height was not restored.")
         tree.Nodes.Remove(node)
         sessions.Remove(item.FilePath)
         surface.Dispose()
@@ -1386,10 +1464,15 @@ Friend NotInheritable Class ManagerWindow
     End Function
 
     Private Function DisplaySize(display As String) As Size
-        If display = "Auto fit" Then Return New Size(Math.Min(8192, Math.Max(200, stage.ClientSize.Width)),
-                                                     Math.Min(8192, Math.Max(200, stage.ClientSize.Height)))
+        If display = "Auto fit" Then Return DesktopView.ProtocolSize(stage.ClientSize)
         Dim parts = display.Split("×"c)
         Return New Size(Integer.Parse(parts(0).Trim()), Integer.Parse(parts(1).Trim()))
+    End Function
+
+    Private Function LiveDisplaySize(display As String) As Size
+        Dim size = DisplaySize(display)
+        If size.Width Mod 2 <> 0 Then Throw New FormatException("Live RDP resolution needs an even width, such as 1920 × 1080.")
+        Return size
     End Function
 
     Private Sub QueueDisplay()
@@ -1408,8 +1491,8 @@ Friend NotInheritable Class ManagerWindow
         Dim item = Selected()
         Dim active As Session = Nothing
         If item IsNot Nothing AndAlso sessions.TryGetValue(item.FilePath, active) AndAlso active.SeenConnection AndAlso
-            active.ResolutionText = "Auto fit" Then
-            UpdateActiveDisplay(item, active, "Auto fit")
+            active.ResolutionText = "Auto fit" AndAlso active.RequestedSize.IsEmpty Then
+            UpdateAutoDisplay(active)
         End If
     End Sub
 
@@ -1418,59 +1501,113 @@ Friend NotInheritable Class ManagerWindow
         If item Is Nothing OrElse item.NativeRequired() Then Return
         Dim display = CanonicalResolution(resolution.Text)
         Dim active As Session = Nothing
-        If sessions.TryGetValue(item.FilePath, active) AndAlso
-            (Not active.SeenConnection OrElse Not UpdateActiveDisplay(item, active, display)) Then
+        If Not sessions.TryGetValue(item.FilePath, active) Then
+            SaveResolution(item, display)
+            resolution.Text = display
+            Return
+        End If
+        If Not active.SeenConnection OrElse active.View.ConnectionState <> 1 Then
             LoadResolution()
             Return
         End If
+        Dim size = LiveDisplaySize(display)
+        If display <> "Auto fit" AndAlso active.RequestedSize = size Then Return
+        active.RequestedSize = Size.Empty
+        If display = "Auto fit" Then
+            If UpdateAutoDisplay(active) Then SaveResolution(item, display)
+        ElseIf active.View.RemoteSize = size Then
+            CommitFixedDisplay(item, active, size)
+        Else
+            Try
+                active.View.UpdateDisplay(size, 96)
+                active.RequestedSize = size
+                active.ResolutionDeadline = DateTime.UtcNow.AddSeconds(6)
+                statusText.Text = "Waiting for the remote desktop to confirm " & display & "…"
+            Catch ex As COMException
+                statusText.Text = "Windows rejected the RDP resize (0x" & ex.ErrorCode.ToString("X8") & ")."
+            End Try
+        End If
+        LoadResolution()
+    End Sub
+
+    Private Sub SaveResolution(item As Connection, display As String)
         Dim edits = ProfileEdits.Read(EditPath(item))
+        If edits.Resolution = display Then Return
         edits.Resolution = display
         edits.Save(EditPath(item))
         item.Edits = edits
-        resolution.Text = display
     End Sub
 
-    Private Function UpdateActiveDisplay(item As Connection, active As Session, display As String) As Boolean
-        Dim automatic = display = "Auto fit"
-        Dim size = DisplaySize(display)
-        Dim dpi = If(automatic, Math.Max(96, CInt(GetDpiForWindow(Handle))), 96)
-        If active.AppliedSize = size AndAlso active.AppliedDpi = dpi AndAlso active.ResolutionText = display Then Return True
+    Private Function UpdateAutoDisplay(active As Session) As Boolean
+        Dim size = DisplaySize("Auto fit")
+        Dim dpi = Math.Max(96, CInt(GetDpiForWindow(Handle)))
+        If active.AppliedSize = size AndAlso active.AppliedDpi = dpi AndAlso active.ResolutionText = "Auto fit" Then Return True
         Try
             If active.View.ConnectionState <> 1 Then Return False
-            active.View.UpdateDisplay(size, dpi)
-            active.View.SetSmartSizing(automatic)
-        Catch ex As Exception When TypeOf ex Is COMException OrElse TypeOf ex Is InvalidOperationException
-            If Not automatic Then
-                statusText.Text = "The RDP client rejected the live resolution update. The session is still open."
-                Return False
-            End If
-            Try
-                active.View.SetSmartSizing(True)
-            Catch sizingError As Exception When TypeOf sizingError Is COMException OrElse TypeOf sizingError Is InvalidOperationException
-                statusText.Text = "The RDP client could not apply Auto fit."
-                Return False
-            End Try
-            statusText.Text = "Auto fit is scaling locally. The RDP client declined the remote size change."
+            active.View.SetSmartSizing(True)
+        Catch ex As COMException
+            statusText.Text = "Windows could not enable Auto fit (0x" & ex.ErrorCode.ToString("X8") & ")."
+            Return False
         End Try
-        active.View.Dock = If(automatic, DockStyle.Fill, DockStyle.None)
-        active.Surface.AutoScroll = Not automatic
-        If Not automatic Then
-            active.Surface.AutoScrollPosition = Point.Empty
-            active.View.Location = Point.Empty
-            active.View.Size = size
-        End If
-        active.ResolutionText = display
+        Try
+            active.View.UpdateDisplay(size, dpi)
+        Catch ex As COMException
+            statusText.Text = "Auto fit is scaling locally (RDP resize 0x" & ex.ErrorCode.ToString("X8") & ")."
+        End Try
+        active.View.Dock = DockStyle.Fill
+        active.Surface.AutoScroll = False
+        active.ResolutionText = "Auto fit"
         active.AppliedSize = size
         active.AppliedDpi = dpi
         Return True
     End Function
+
+    Private Sub CommitFixedDisplay(item As Connection, active As Session, size As Size)
+        Try
+            active.View.SetSmartSizing(False)
+        Catch ex As COMException
+            statusText.Text = "The remote size changed, but Windows could not disable scaling (0x" & ex.ErrorCode.ToString("X8") & ")."
+            Return
+        End Try
+        active.View.Dock = DockStyle.None
+        active.Surface.AutoScroll = True
+        active.Surface.AutoScrollPosition = Point.Empty
+        active.View.Location = Point.Empty
+        active.View.Size = size
+        active.ResolutionText = size.Width & " × " & size.Height
+        active.AppliedSize = size
+        active.AppliedDpi = 96
+        statusText.Text = "Remote resolution set to " & active.ResolutionText & "."
+        SaveResolution(item, active.ResolutionText)
+    End Sub
+
+    Private Sub CheckRequestedDisplay(active As Session)
+        If active.RequestedSize.IsEmpty Then Return
+        Dim selectedItem = Selected()
+        Dim sessionItem = ConnectionForSession(active)
+        Dim isSelected = selectedItem IsNot Nothing AndAlso String.Equals(selectedItem.FilePath, sessionItem.FilePath, StringComparison.OrdinalIgnoreCase)
+        If active.View.RemoteSize = active.RequestedSize Then
+            Dim confirmed = active.RequestedSize
+            active.RequestedSize = Size.Empty
+            Dim item = If(isSelected, selectedItem, sessionItem)
+            Run(Sub() CommitFixedDisplay(item, active, confirmed))
+        ElseIf DateTime.UtcNow >= active.ResolutionDeadline Then
+            active.RequestedSize = Size.Empty
+            statusText.Text = sessionItem.Title & " did not confirm the requested resolution."
+        Else
+            Return
+        End If
+        If isSelected Then LoadResolution()
+        QueueDisplay()
+    End Sub
 
     Private Sub LoadResolution()
         Dim item = Selected()
         If item Is Nothing OrElse item.NativeRequired() Then Return
         Dim active As Session = Nothing
         If sessions.TryGetValue(item.FilePath, active) Then
-            resolution.Text = active.ResolutionText
+            resolution.Text = If(active.RequestedSize.IsEmpty, active.ResolutionText,
+                active.RequestedSize.Width & " × " & active.RequestedSize.Height)
             Return
         End If
         If item.Edits IsNot Nothing AndAlso item.Edits.Resolution.Length > 0 Then
@@ -1555,6 +1692,7 @@ Friend NotInheritable Class ManagerWindow
                 completed.Add(pair.Key)
                 Continue For
             End Try
+            If state = 1 Then CheckRequestedDisplay(pair.Value)
             If state = 1 AndAlso Not pair.Value.SeenConnection Then
                 pair.Value.SeenConnection = True
                 statusText.Text = "Connected to " & ConnectionForSession(pair.Value).Title & "."
@@ -1607,10 +1745,16 @@ Friend Module Program
                     view.Configure(New Connection With {.Address = "localhost"}, New Size(1024, 768), True)
                     If view.ConnectionState <> 0 Then Throw New InvalidOperationException("Unexpected connection state.")
                     view.SetSmartSizing(False)
+                    If DesktopView.ProtocolSize(New Size(1025, 769)) <> New Size(1024, 769) OrElse
+                        DesktopView.ProtocolSize(New Size(8193, 199)) <> New Size(8192, 200) Then
+                        Throw New InvalidOperationException("RDP monitor dimensions were not normalized.")
+                    End If
+                    Dim disconnectedResize As String = "returned successfully"
                     Try
                         view.UpdateDisplay(New Size(1280, 800), 144)
                     Catch failure As COMException
-                        If failure.ErrorCode = &H80020003 OrElse failure.ErrorCode = &H80020006 Then Throw
+                        If failure.ErrorCode <> &H80004005 AndAlso failure.ErrorCode <> &H8007139F AndAlso failure.ErrorCode <> &H8000FFFF Then Throw
+                        disconnectedResize = "HRESULT 0x" & failure.ErrorCode.ToString("X8")
                     End Try
                     Dim fixture = args(1) & ".xml"
                     Dim edits As New ProfileEdits With {.Title = "Fixture", .Address = "example.test:3390", .Resolution = "1280 × 800",
@@ -1628,7 +1772,7 @@ Friend Module Program
                     loaded.Save(fixture)
                     If ProfileEdits.Read(fixture).PasswordCipher <> "" Then Throw New InvalidOperationException("Credential clear failed.")
                     VerifyBackup(args(1) & ".backup-test")
-                    IO.File.WriteAllText(args(1), "ActiveX and live display method binding verified. Profile options and Windows DPAPI credentials round-tripped. Full screen centered, pinned, hid and revealed its controls while retaining the same RDP control. Backup restored desktop, RemoteApp and workspace profiles and skipped duplicates. All three palettes applied and reloaded, and the executable and window icons matched. Sidebar actions fit at the minimum window and sidebar widths.")
+                    IO.File.WriteAllText(args(1), "ActiveX display binding and monitor bounds verified. Disconnected resize: " & disconnectedResize & ". Profile options and Windows DPAPI credentials round-tripped. Full screen centered, pinned, hid and revealed its controls while retaining the same RDP control. Backup restored desktop, RemoteApp and workspace profiles and skipped duplicates. All three palettes applied and reloaded, and the executable and window icons matched. Sidebar actions fit at minimum width. An unconfirmed resize kept Auto fit and the current layout.")
                 End Using
             Catch ex As Exception
                 IO.File.WriteAllText(args(1), ex.ToString())
